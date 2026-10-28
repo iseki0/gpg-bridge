@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -79,7 +80,7 @@ def main():
             old = config_snapshot()
             run('git', 'commit', '--allow-empty', '-qm', 'unsigned baseline')
 
-            def start(auto=True, ttl=120):
+            def start(auto=True, ttl=120, tailscale=False):
                 with socket.socket() as sock:
                     sock.bind(('127.0.0.1', 0))
                     port = sock.getsockname()[1]
@@ -87,6 +88,10 @@ def main():
                 log = logfile.open('wb')
                 cmd = [exe, 'serve', '--bind', f'127.0.0.1:{port}', '--endpoint', f'http://127.0.0.1:{port}',
                        '--homedir', home, '--gpg', signer, '--key', primary, '--ttl', str(ttl)]
+                if tailscale:
+                    cmd.extend(['--tailscale-serve'])
+                    at = cmd.index('--endpoint')
+                    del cmd[at:at + 2]
                 if auto:
                     cmd.append('--auto-approve')
                 p = subprocess.Popen(list(map(str, cmd)), env=env, stdin=subprocess.PIPE,
@@ -193,6 +198,46 @@ def main():
             run(exe, 'disconnect')
             assert run('git', 'config', 'commit.gpgsign').stdout.strip() == b'false'
             print('PASS: disconnect preserves Git settings modified after connect')
+
+            # A local CLI stub exercises Serve without changing any tailnet.
+            tailscale = bindir / 'tailscale'
+            tailscale.write_text(
+                '#!' + sys.executable + '\n'
+                'import json, os, sys\n'
+                'from pathlib import Path\n'
+                'with Path(os.environ["TAILSCALE_TEST_CALLS"]).open("a") as f:\n'
+                '    f.write(json.dumps(sys.argv[1:]) + "\\n")\n'
+                'if sys.argv[1:] == ["status", "--json"]:\n'
+                '    print(json.dumps({"Self": {"DNSName": "test.tailnet.ts.net."}}))\n'
+                'else:\n'
+                '    print("Tailscale informational output")\n'
+                '    sys.exit(int(os.environ.get("TAILSCALE_TEST_FAIL", "0")))\n'
+            )
+            tailscale.chmod(0o700)
+            calls = root / 'tailscale-calls.jsonl'
+            env['PATH'] = str(bindir) + os.pathsep + env['PATH']
+            env['TAILSCALE_TEST_CALLS'] = str(calls)
+            server, ticket, log = start(tailscale=True)
+            payload = ticket.removeprefix('gpgbridge:v1:')
+            decoded = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+            assert decoded['endpoint'] == 'https://test.tailnet.ts.net'
+            invoked = [json.loads(line) for line in calls.read_text().splitlines()]
+            assert invoked[0][:2] == ['serve', '--bg']
+            assert invoked[0][2].startswith('http://127.0.0.1:')
+            assert invoked[1] == ['status', '--json']
+            assert 'Tailscale informational output' in log.read_text()
+            server.terminate()
+            server.wait(timeout=5)
+            env['TAILSCALE_TEST_FAIL'] = '1'
+            result = run(exe, 'serve', '--tailscale-serve', '--homedir', home,
+                         '--gpg', signer, '--key', primary, success=False)
+            assert not result.stdout
+            assert 'Tailscale Serve 启动失败' in result.stderr.decode()
+            for bind in ['0.0.0.0:17389', '127.0.0.1:0']:
+                result = run(exe, 'serve', '--tailscale-serve', '--bind', bind, success=False)
+                assert not result.stdout
+                assert '--tailscale-serve 需要' in result.stderr.decode()
+            print('PASS: automatic Tailscale Serve, HTTPS discovery, clean ticket output, failure and invalid bind rejection (CLI stub)')
 
             # Credential output must not leak into the separately captured server audit.
             all_logs = ''.join(p.read_text(errors='replace') for p in root.glob('server-*.log'))

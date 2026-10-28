@@ -24,7 +24,15 @@ Rust 实现的临时远程 OpenPGP 签名服务：Windows 保存私钥并使用�
 .\bin\windows-x86_64\gpg-bridge.exe serve --choose
 ```
 
-默认只监听 `127.0.0.1:17389`，配合 Tailscale Serve。在另一个终端运行：
+默认只监听 `127.0.0.1:17389`。加上 `--tailscale-serve` 可自动启用 Tailscale Serve：
+
+```powershell
+.\bin\windows-x86_64\gpg-bridge.exe serve --tailscale-serve
+```
+
+需要已安装并登录 Tailscale，并按提示启用 tailnet HTTPS。程序自动执行 `tailscale serve --bg http://127.0.0.1:17389`；自定义回环 `--bind` 时转发到对应地址。命令失败或超时会中止启动，输出写入标准错误。Windows 同时检查 Tailscale 默认安装目录。退出后 Serve 配置仍保留，可用 `tailscale serve --https=443 off` 关闭该入口。
+
+也可以不加参数，在另一个终端手动运行：
 
 ```powershell
 tailscale serve --bg 17389

@@ -1,3 +1,16 @@
+# 本次更新验证
+
+记录日期：2026-10-28（Asia/Shanghai）。
+
+- 新增 `serve --tailscale-serve`，自动运行 Tailscale Serve；README 已补充使用和关闭方式。
+- 已读取 GitHub Actions 运行 `40617888326` 的 Windows 日志：失败原因为 `src/main.rs` 的 `clippy::cmp_owned`。已将临时 `PathBuf` 比较改为借用 `OsStr` 比较，保留 `-D warnings`。
+- Linux `cargo fmt --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked`（12 个单元测试）、release 构建全部通过。
+- 真实 GnuPG 集成测试全部通过，包括签名、验签、确认、过期及配置恢复；此次环境可正常启动 gpg-agent。
+- 新增 Tailscale CLI 模拟集成检查并通过：自动转发到实际监听地址、自动发现 HTTPS 地址、标准输出只含连接串、启动失败不输出凭证、拒绝通配地址和零端口。
+- 未连接真实 Tailscale，也未在 Windows 本机执行。Windows 交叉检查因环境缺少 MinGW C 编译器而未完成；远端 CI 尚未重新运行。
+
+以下为保留的首版交付记录。
+
 # 首版验证记录
 
 版本：0.1.0。记录日期：2026-10-24（Asia/Shanghai）。

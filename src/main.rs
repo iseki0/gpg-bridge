@@ -26,6 +26,9 @@ enum Commands {
         /// 云端能访问的 HTTP/HTTPS 根地址；省略时按监听地址或 Tailscale 主机名推导
         #[arg(long)]
         endpoint: Option<String>,
+        /// 自动运行 tailscale serve --bg，将 HTTPS 入口转发到本机监听地址
+        #[arg(long)]
+        tailscale_serve: bool,
         /// 会话有效期（秒），最大 86400
         #[arg(long, default_value_t = 28800)]
         ttl: u64,
@@ -97,6 +100,7 @@ async fn run() -> Result<i32> {
         Commands::Serve {
             bind,
             endpoint,
+            tailscale_serve,
             ttl,
             auto_approve,
             allow_data,
@@ -112,15 +116,22 @@ async fn run() -> Result<i32> {
                 gpg_timeout > 0 && gpg_timeout <= 600,
                 "--gpg-timeout 必须为 1 至 600 秒"
             );
+            ensure!(
+                !tailscale_serve || (bind.ip().is_loopback() && bind.port() != 0),
+                "--tailscale-serve 需要非零端口的回环监听地址"
+            );
             let gpg = Gpg {
                 program: locate_gpg(gpg)?,
                 homedir,
                 timeout: Duration::from_secs(gpg_timeout),
             };
             let keys = gpg::select_keys(&gpg, &key, !choose).await?;
+            if tailscale_serve {
+                start_tailscale_serve(bind).await?;
+            }
             let endpoint = match endpoint {
                 Some(e) => e,
-                None => default_endpoint(bind).await?,
+                None => default_endpoint(bind, tailscale_serve).await?,
             };
             server::run(server::Options {
                 bind,
@@ -148,7 +159,7 @@ fn locate_gpg(program: PathBuf) -> Result<PathBuf> {
     }
     #[cfg(windows)]
     {
-        if program != PathBuf::from("gpg") {
+        if program.as_os_str() != "gpg" {
             return client::resolve_program(program);
         }
         for root in ["ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"] {
@@ -168,11 +179,41 @@ fn locate_gpg(program: PathBuf) -> Result<PathBuf> {
     }
     client::resolve_program(program)
 }
-async fn default_endpoint(bind: SocketAddr) -> Result<String> {
+fn locate_tailscale() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("ProgramFiles") {
+        let path = PathBuf::from(root).join("Tailscale/tailscale.exe");
+        if path.is_file() {
+            return path;
+        }
+    }
+    PathBuf::from("tailscale")
+}
+
+async fn start_tailscale_serve(bind: SocketAddr) -> Result<()> {
+    let mut command = tokio::process::Command::new(locate_tailscale());
+    command
+        .args(["serve", "--bg", &format!("http://{bind}")])
+        // Keep stdout reserved for the pairing ticket.
+        .stdout(std::process::Stdio::from(std::io::stderr()))
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(Duration::from_secs(60), command.status())
+        .await
+        .context("Tailscale Serve 启动超时；请先登录 Tailscale 并启用 HTTPS")?
+        .context("无法启动 Tailscale；请确认已安装并登录")?;
+    ensure!(status.success(), "Tailscale Serve 启动失败；请检查上方提示");
+    eprintln!(
+        "Tailscale Serve 已启用；退出后保持配置，可用 tailscale serve --https=443 off 关闭该入口。"
+    );
+    Ok(())
+}
+
+async fn default_endpoint(bind: SocketAddr, tailscale_serve: bool) -> Result<String> {
     if !bind.ip().is_loopback() && !bind.ip().is_unspecified() {
         return Ok(format!("http://{bind}"));
     }
-    let output = tokio::process::Command::new("tailscale")
+    let output = tokio::process::Command::new(locate_tailscale())
         .args(["status", "--json"])
         .output()
         .await
@@ -189,10 +230,12 @@ async fn default_endpoint(bind: SocketAddr) -> Result<String> {
         .filter(|s| !s.is_empty())
         .context("无法取得 Tailscale DNS 名称；请用 --endpoint 指定")?;
     if bind.ip().is_loopback() {
-        eprintln!(
-            "使用 Tailscale HTTPS 地址；请另开终端运行 tailscale serve {}。",
-            bind.port()
-        );
+        if !tailscale_serve {
+            eprintln!(
+                "使用 Tailscale HTTPS 地址；请另开终端运行 tailscale serve --bg {}。",
+                bind.port()
+            );
+        }
         Ok(format!("https://{}", dns.trim_end_matches('.')))
     } else {
         anyhow::bail!("通配监听需要 --endpoint 明确指定云端地址")
