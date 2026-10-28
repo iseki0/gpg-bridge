@@ -30,12 +30,20 @@ Rust 实现的临时远程 OpenPGP 签名服务：Windows 保存私钥并使用�
 .\bin\windows-x86_64\gpg-bridge.exe serve --tailscale-serve
 ```
 
-需要已安装并登录 Tailscale，并按提示启用 tailnet HTTPS。程序自动执行 `tailscale serve --bg http://127.0.0.1:17389`；自定义回环 `--bind` 时转发到对应地址。命令失败或超时会中止启动，输出写入标准错误。Windows 同时检查 Tailscale 默认安装目录。退出后 Serve 配置仍保留，可用 `tailscale serve --https=443 off` 关闭该入口。
+需要已安装并登录 Tailscale，并启用 tailnet HTTPS。程序自动以前台会话运行 `tailscale serve --https=17390 http://127.0.0.1:17389`，不用 `--bg`；Ctrl+C、会话到期、启动失败或 Unix SIGTERM 时结束该进程，其会话转发由 Tailscale 自动移除。Tailscale 提前退出也会停止签名服务。只管理本次前台会话，不清空其他 Serve 配置。命令失败或 60 秒内未就绪会中止启动；确认就绪后才输出连接串。Windows 同时检查 Tailscale 默认安装目录。
+
+HTTPS 入口默认固定为 **17390**，不占用 443；`--tailscale-port` 可指定入口端口，`--bind` 指定本机 HTTP 目标，两者独立：
+
+```powershell
+.\bin\windows-x86_64\gpg-bridge.exe serve --tailscale-serve --tailscale-port 18443 --bind 127.0.0.1:17389
+```
+
+自动生成的连接串包含实际 HTTPS 端口。协议仍为 `gpgbridge:v1`，HTTP API 和 Noise 消息格式不变，现有云端客户端无需升级；新会话用新连接串重新配对即可。
 
 也可以不加参数，在另一个终端手动运行：
 
 ```powershell
-tailscale serve --bg 17389
+tailscale serve --https=17390 http://127.0.0.1:17389
 ```
 
 服务端向标准输出打印一行 `gpgbridge:v1:...`，这是临时签名凭证。动作日志只写标准错误和可选日志文件，不包含这行凭证。复制该行给预期的 Codex 任务即可。
@@ -43,13 +51,13 @@ tailscale serve --bg 17389
 若未能自动发现，使用显式地址：
 
 ```powershell
-.\bin\windows-x86_64\gpg-bridge.exe serve --endpoint https://your-pc.your-tailnet.ts.net
+.\bin\windows-x86_64\gpg-bridge.exe serve --endpoint https://your-pc.your-tailnet.ts.net:17390
 ```
 
 GPG 不在默认安装目录时：
 
 ```powershell
-.\bin\windows-x86_64\gpg-bridge.exe serve --gpg 'C:\path\to\gpg.exe' --endpoint https://your-pc.your-tailnet.ts.net
+.\bin\windows-x86_64\gpg-bridge.exe serve --gpg 'C:\path\to\gpg.exe' --endpoint https://your-pc.your-tailnet.ts.net:17390
 ```
 
 ### 2. Codex：配置网络
@@ -62,7 +70,7 @@ GPG 不在默认安装目录时：
 tailscale funnel --bg 17389
 ```
 
-Funnel 将 HTTPS 入口发布到公网；Codex 仍须允许这个域名。程序的应用层认证与端到端加密始终保留。Serve/Funnel 的开关由你管理，停止 gpg-bridge 不会更改已有 Tailscale 配置。
+Funnel 将 HTTPS 入口发布到公网；Codex 仍须允许这个域名。程序的应用层认证与端到端加密始终保留。手工运行的 Serve/Funnel 由你管理；`--tailscale-serve` 创建的前台会话随 gpg-bridge 停止而关闭。使用上述手工 Funnel 的默认 443 端口时，需用 `--endpoint https://your-pc.your-tailnet.ts.net` 指定不带 17390 的地址。
 
 HTTPS 校验使用系统信任根，兼容已正确安装 CA 的企业/云端代理；不会关闭证书校验。客户端尊重标准代理环境变量（例如 `HTTPS_PROXY`、`HTTP_PROXY`、`ALL_PROXY`、`NO_PROXY`）。云端平台要求经过代理时，保留其设置。应用不会自动重写网络规则、安装 VPN 或申请绕过限制。
 

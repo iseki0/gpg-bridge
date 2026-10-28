@@ -1,3 +1,15 @@
+# Tailscale 生命周期与端口更新
+
+记录日期：2026-10-28（Asia/Shanghai）。
+
+- 去掉 `--bg`，托管 Tailscale Serve 前台会话，默认 HTTPS 入口 17390，可用 `--tailscale-port` 指定；`--bind` 继续控制本机 HTTP 目标。
+- 读取 Tailscale 官方 CLI 实现，确认前台会话在 CLI 连接关闭后由 daemon 删除本会话转发，无需全局 reset/off。
+- CLI 模拟集成测试通过：默认/自定义端口、标准输出只含连接串、Ctrl+C/SIGTERM/到期/服务启动失败时子进程结束、Tailscale 提前退出时签名服务停止。
+- 协议文件、HTTP API 和客户端代码未改。使用改动前保存的客户端二进制执行完整真实 GnuPG 集成检查，通过配对、签名、验签、确认、过期、错误口令拒绝及 loopback 口令签名。
+- Linux fmt、Clippy、12 个单元测试及 release 构建通过。真实 Tailscale/Windows 设备行为尚未现场验证。
+
+以下为此前更新与首版的历史记录；旧记录中的 `--bg`/退出保留配置行为已由本节替代。
+
 # GPG 无人值守口令更新
 
 记录日期：2026-10-28（Asia/Shanghai）。

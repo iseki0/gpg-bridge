@@ -6,6 +6,7 @@ use gpg_bridge::{
     server,
 };
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
@@ -27,9 +28,12 @@ enum Commands {
         /// 云端能访问的 HTTP/HTTPS 根地址；省略时按监听地址或 Tailscale 主机名推导
         #[arg(long)]
         endpoint: Option<String>,
-        /// 自动运行 tailscale serve --bg，将 HTTPS 入口转发到本机监听地址
+        /// 自动以前台会话运行 Tailscale Serve，随本程序退出一起停止
         #[arg(long)]
         tailscale_serve: bool,
+        /// Tailscale Serve 的 HTTPS 入口端口（与 --bind 的本机 HTTP 端口独立）
+        #[arg(long, default_value_t = 17390, value_parser = clap::value_parser!(u16).range(1..))]
+        tailscale_port: u16,
         /// 会话有效期（秒），最大 86400
         #[arg(long, default_value_t = 28800)]
         ttl: u64,
@@ -108,6 +112,7 @@ async fn run() -> Result<i32> {
             bind,
             endpoint,
             tailscale_serve,
+            tailscale_port,
             ttl,
             auto_approve,
             allow_data,
@@ -159,14 +164,16 @@ async fn run() -> Result<i32> {
                 passphrase,
             };
             let keys = gpg::select_keys(&gpg, &key, !choose).await?;
-            if tailscale_serve {
-                start_tailscale_serve(bind).await?;
-            }
             let endpoint = match endpoint {
                 Some(e) => e,
-                None => default_endpoint(bind, tailscale_serve).await?,
+                None => default_endpoint(bind, tailscale_serve, tailscale_port).await?,
             };
-            server::run(server::Options {
+            let mut tailscale = if tailscale_serve {
+                Some(start_tailscale_serve(bind, tailscale_port).await?)
+            } else {
+                None
+            };
+            let server = server::run(server::Options {
                 bind,
                 endpoint,
                 ttl,
@@ -176,8 +183,22 @@ async fn run() -> Result<i32> {
                 log_file,
                 keys,
                 gpg,
-            })
-            .await?;
+            });
+            if let Some(child) = &mut tailscale {
+                let result = tokio::select! {
+                    result = server => result,
+                    _ = termination_signal() => Ok(()),
+                    status = child.wait() => {
+                        anyhow::bail!("Tailscale Serve 提前退出：{}", status?);
+                    }
+                };
+                // Closing the foreground CLI's daemon session removes only its
+                // own forwarding config, including on server startup failures.
+                child.kill().await.context("无法停止 Tailscale Serve")?;
+                result?;
+            } else {
+                server.await?;
+            }
         }
         Commands::Connect { ticket_file, gpg } => client::connect(ticket_file, gpg).await?,
         Commands::Disconnect => client::disconnect().await?,
@@ -223,26 +244,51 @@ fn locate_tailscale() -> PathBuf {
     PathBuf::from("tailscale")
 }
 
-async fn start_tailscale_serve(bind: SocketAddr) -> Result<()> {
-    let mut command = tokio::process::Command::new(locate_tailscale());
-    command
-        .args(["serve", "--bg", &format!("http://{bind}")])
-        // Keep stdout reserved for the pairing ticket.
-        .stdout(std::process::Stdio::from(std::io::stderr()))
+async fn start_tailscale_serve(bind: SocketAddr, port: u16) -> Result<tokio::process::Child> {
+    let mut child = tokio::process::Command::new(locate_tailscale())
+        .args([
+            "serve",
+            &format!("--https={port}"),
+            &format!("http://{bind}"),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .kill_on_drop(true);
-    let status = tokio::time::timeout(Duration::from_secs(60), command.status())
-        .await
-        .context("Tailscale Serve 启动超时；请先登录 Tailscale 并启用 HTTPS")?
+        .kill_on_drop(true)
+        .spawn()
         .context("无法启动 Tailscale；请确认已安装并登录")?;
-    ensure!(status.success(), "Tailscale Serve 启动失败；请检查上方提示");
-    eprintln!(
-        "Tailscale Serve 已启用；退出后保持配置，可用 tailscale serve --https=443 off 关闭该入口。"
-    );
-    Ok(())
+    let mut lines = BufReader::new(
+        child
+            .stdout
+            .take()
+            .context("Tailscale stdout unavailable")?,
+    )
+    .lines();
+    // Tailscale prints this after SetServeConfig succeeds. Do not publish a
+    // pairing ticket while HTTPS setup is still pending or has failed.
+    tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(line) = lines.next_line().await? {
+                eprintln!("{}", gpg_bridge::util::display(&line));
+                if line.trim() == "Press Ctrl+C to exit." {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+            anyhow::bail!("Tailscale Serve 启动失败；请检查上方提示");
+        }) => { result.context("Tailscale Serve 启动超时；请先登录 Tailscale 并启用 HTTPS")??; },
+        _ = tokio::signal::ctrl_c() => { anyhow::bail!("已取消 Tailscale Serve 启动"); }
+        _ = termination_signal() => { anyhow::bail!("已取消 Tailscale Serve 启动"); }
+    }
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("{}", gpg_bridge::util::display(&line));
+        }
+    });
+    eprintln!("Tailscale Serve 已启用，HTTPS 端口 {port}；退出时一起停止。");
+    Ok(child)
 }
 
-async fn default_endpoint(bind: SocketAddr, tailscale_serve: bool) -> Result<String> {
+async fn default_endpoint(bind: SocketAddr, tailscale_serve: bool, port: u16) -> Result<String> {
     if !bind.ip().is_loopback() && !bind.ip().is_unspecified() {
         return Ok(format!("http://{bind}"));
     }
@@ -265,12 +311,25 @@ async fn default_endpoint(bind: SocketAddr, tailscale_serve: bool) -> Result<Str
     if bind.ip().is_loopback() {
         if !tailscale_serve {
             eprintln!(
-                "使用 Tailscale HTTPS 地址；请另开终端运行 tailscale serve --bg {}。",
-                bind.port()
+                "使用 Tailscale HTTPS 地址；请另开终端运行 tailscale serve --https={port} http://{bind}。"
             );
         }
-        Ok(format!("https://{}", dns.trim_end_matches('.')))
+        Ok(format!("https://{}:{port}", dns.trim_end_matches('.')))
     } else {
         anyhow::bail!("通配监听需要 --endpoint 明确指定云端地址")
     }
+}
+
+// Unix service managers use SIGTERM rather than Ctrl+C.
+async fn termination_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            signal.recv().await;
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
 }

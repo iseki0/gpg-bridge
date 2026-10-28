@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -18,6 +19,7 @@ import time
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', default='target/debug/gpg-bridge')
+    parser.add_argument('--client-binary', help='Optional older client for wire compatibility checks')
     parser.add_argument('--portable-fixture', action='store_true', help='PGPy signing fixture + real GPG verification; does NOT test gpg-agent')
     args = parser.parse_args()
     binary = Path(args.binary).resolve()
@@ -36,6 +38,9 @@ def main():
         exe = bindir / 'gpg-bridge'
         shutil.copy2(binary, exe)
         exe.chmod(0o700)
+        client = bindir / 'gpg-bridge-client'
+        shutil.copy2(Path(args.client_binary).resolve() if args.client_binary else binary, client)
+        client.chmod(0o700)
         env['XDG_CONFIG_HOME'] = str(root / 'config')
 
         def run(*argv, cwd=repo, data=None, success=True):
@@ -104,10 +109,10 @@ def main():
                 return p, ticket, logfile
 
             server, ticket, log = start()
-            run(exe, 'connect', data=(ticket + '\n').encode())
+            run(client, 'connect', data=(ticket + '\n').encode())
             cfg_path = repo / '.git/gpg-bridge-client.json'
             assert cfg_path.stat().st_mode & 0o777 == 0o600
-            run(exe, 'status')
+            run(client, 'status')
             run('git', 'commit', '--allow-empty', '-qm', 'signed through bridge')
             run('git', 'verify-commit', 'HEAD')
             verify = run('git', 'log', '-1', '--format=%GF').stdout.decode().strip()
@@ -135,7 +140,7 @@ def main():
             config = json.loads(raw)
             config['ticket']['psk'] = base64.urlsafe_b64encode(bytes(32)).decode().rstrip('=')
             cfg_path.write_text(json.dumps(config))
-            run(exe, 'status', success=False)
+            run(client, 'status', success=False)
             cfg_path.write_bytes(raw)
             print('PASS: wrong pairing credential rejected')
 
@@ -150,13 +155,13 @@ def main():
             server.wait(timeout=5)
             run('git', 'verify-commit', 'HEAD')
             run('git', 'verify-tag', 'v-test')
-            run(exe, 'disconnect')
+            run(client, 'disconnect')
             assert config_snapshot() == old, (config_snapshot(), old)
             assert not cfg_path.exists()
             print('PASS: offline verification and exact restoration of prior Git configuration')
 
             server, ticket, log = start(auto=False)
-            run(exe, 'connect', data=(ticket + '\n').encode())
+            run(client, 'connect', data=(ticket + '\n').encode())
             before = run('git', 'rev-parse', 'HEAD').stdout
             for answer, expected in [('n', False), ('y', True)]:
                 previous_log_size = log.stat().st_size
@@ -180,23 +185,23 @@ def main():
                     run('git', 'verify-commit', 'HEAD')
                 else:
                     assert run('git', 'rev-parse', 'HEAD').stdout == before
-            run(exe, 'disconnect')
+            run(client, 'disconnect')
             server.terminate()
             server.wait(timeout=5)
             print('PASS: real local confirmation denies N and permits Y')
 
             server, ticket, log = start(ttl=3)
-            run(exe, 'connect', data=(ticket + '\n').encode())
+            run(client, 'connect', data=(ticket + '\n').encode())
             server.wait(timeout=10)
-            run(exe, 'status', success=False)
+            run(client, 'status', success=False)
             run('git', 'commit', '--allow-empty', '-qm', 'expired', success=False)
-            run(exe, 'disconnect')
+            run(client, 'disconnect')
             print('PASS: expiry stops server, blocks signing, still permits disconnect')
 
             server, ticket, log = start()
-            run(exe, 'connect', data=(ticket + '\n').encode())
+            run(client, 'connect', data=(ticket + '\n').encode())
             run('git', 'config', 'commit.gpgsign', 'false')
-            run(exe, 'disconnect')
+            run(client, 'disconnect')
             assert run('git', 'config', 'commit.gpgsign').stdout.strip() == b'false'
             print('PASS: disconnect preserves Git settings modified after connect')
 
@@ -204,31 +209,67 @@ def main():
             tailscale = bindir / 'tailscale'
             tailscale.write_text(
                 '#!' + sys.executable + '\n'
-                'import json, os, sys\n'
+                'import json, os, sys, time\n'
                 'from pathlib import Path\n'
                 'with Path(os.environ["TAILSCALE_TEST_CALLS"]).open("a") as f:\n'
                 '    f.write(json.dumps(sys.argv[1:]) + "\\n")\n'
                 'if sys.argv[1:] == ["status", "--json"]:\n'
                 '    print(json.dumps({"Self": {"DNSName": "test.tailnet.ts.net."}}))\n'
                 'else:\n'
-                '    print("Tailscale informational output")\n'
-                '    sys.exit(int(os.environ.get("TAILSCALE_TEST_FAIL", "0")))\n'
+                '    if os.environ.get("TAILSCALE_TEST_FAIL") == "1": sys.exit(1)\n'
+                '    Path(os.environ["TAILSCALE_TEST_PID"]).write_text(str(os.getpid()))\n'
+                '    print("Tailscale informational output", flush=True)\n'
+                '    print("Press Ctrl+C to exit.", flush=True)\n'
+                '    time.sleep(120)\n'
             )
             tailscale.chmod(0o700)
             calls = root / 'tailscale-calls.jsonl'
             env['PATH'] = str(bindir) + os.pathsep + env['PATH']
             env['TAILSCALE_TEST_CALLS'] = str(calls)
+            pidfile = root / 'tailscale.pid'
+            env['TAILSCALE_TEST_PID'] = str(pidfile)
             server, ticket, log = start(tailscale=True)
             payload = ticket.removeprefix('gpgbridge:v1:')
             decoded = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
-            assert decoded['endpoint'] == 'https://test.tailnet.ts.net'
+            assert decoded['endpoint'] == 'https://test.tailnet.ts.net:17390'
             invoked = [json.loads(line) for line in calls.read_text().splitlines()]
-            assert invoked[0][:2] == ['serve', '--bg']
-            assert invoked[0][2].startswith('http://127.0.0.1:')
-            assert invoked[1] == ['status', '--json']
+            assert invoked[0][:2] == ['status', '--json']
+            assert invoked[1][:2] == ['serve', '--https=17390']
+            assert invoked[1][2].startswith('http://127.0.0.1:')
+            assert all('--bg' not in call for call in invoked)
             assert 'Tailscale informational output' in log.read_text()
             server.terminate()
             server.wait(timeout=5)
+            def assert_tailscale_stopped():
+                try:
+                    os.kill(int(pidfile.read_text()), 0)
+                except ProcessLookupError:
+                    return
+                raise AssertionError('Tailscale child is still running')
+
+            assert_tailscale_stopped()  # SIGTERM
+            for stop in ['interrupt', 'expiry', 'child-exit']:
+                server, ticket, log = start(tailscale=True, ttl=2 if stop == 'expiry' else 120,
+                                            extra=['--tailscale-port', '18443'])
+                payload = ticket.removeprefix('gpgbridge:v1:')
+                decoded = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+                assert decoded['endpoint'] == 'https://test.tailnet.ts.net:18443'
+                if stop == 'interrupt':
+                    server.send_signal(signal.SIGINT)
+                elif stop == 'child-exit':
+                    os.kill(int(pidfile.read_text()), signal.SIGTERM)
+                code = server.wait(timeout=10)
+                assert (code != 0) == (stop == 'child-exit')
+                assert_tailscale_stopped()
+            # A local startup failure must also close the foreground session.
+            existing_log = root / 'existing.log'
+            existing_log.touch()
+            result = run(exe, 'serve', '--tailscale-serve', '--homedir', home,
+                         '--gpg', signer, '--key', primary, '--log-file', existing_log, success=False)
+            assert not result.stdout
+            assert_tailscale_stopped()
+            result = run(exe, 'serve', '--tailscale-port', '0', success=False)
+            assert not result.stdout
             env['TAILSCALE_TEST_FAIL'] = '1'
             result = run(exe, 'serve', '--tailscale-serve', '--homedir', home,
                          '--gpg', signer, '--key', primary, success=False)
@@ -238,7 +279,7 @@ def main():
                 result = run(exe, 'serve', '--tailscale-serve', '--bind', bind, success=False)
                 assert not result.stdout
                 assert '--tailscale-serve 需要' in result.stderr.decode()
-            print('PASS: automatic Tailscale Serve, HTTPS discovery, clean ticket output, failure and invalid bind rejection (CLI stub)')
+            print('PASS: foreground Tailscale Serve, default/custom HTTPS port, Ctrl+C/SIGTERM/expiry/failure cleanup, child-exit detection (CLI stub)')
 
             if not args.portable_fixture:
                 secret = 'test-only passphrase with spaces & quotes\''
@@ -255,11 +296,11 @@ def main():
                 clear_agent()
                 server, ticket, log = start(signing_key=protected,
                     extra=['--gpg-passphrase', 'wrong-test-passphrase'])
-                run(exe, 'connect', data=(ticket + '\n').encode())
+                run(client, 'connect', data=(ticket + '\n').encode())
                 before = run('git', 'rev-parse', 'HEAD').stdout
                 run('git', 'commit', '--allow-empty', '-qm', 'wrong passphrase', success=False)
                 assert run('git', 'rev-parse', 'HEAD').stdout == before
-                run(exe, 'disconnect')
+                run(client, 'disconnect')
                 server.terminate()
                 server.wait(timeout=5)
                 passfile = root / 'passphrase with spaces.txt'
@@ -268,7 +309,7 @@ def main():
                 for extra in [['--gpg-passphrase', secret], ['--gpg-passphrase-file', passfile]]:
                     clear_agent()
                     server, ticket, log = start(signing_key=protected, extra=extra)
-                    run(exe, 'connect', data=(ticket + '\n').encode())
+                    run(client, 'connect', data=(ticket + '\n').encode())
                     run('git', 'config', 'commit.gpgsign', 'true')
                     run('git', 'commit', '--allow-empty', '-qm', 'protected signing without Pinentry')
                     run('git', 'verify-commit', 'HEAD')
@@ -276,7 +317,7 @@ def main():
                     assert actual == protected
                     assert secret not in cfg_path.read_text()
                     assert secret not in log.read_text()
-                    run(exe, 'disconnect')
+                    run(client, 'disconnect')
                     server.terminate()
                     server.wait(timeout=5)
                 result = run(exe, 'serve', '--gpg-passphrase', 'bad\nsecond-line', success=False)
