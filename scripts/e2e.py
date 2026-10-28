@@ -48,7 +48,8 @@ def main():
             return p
 
         def gpg(*argv, **kw):
-            return run(signer, '--homedir', home, '--batch', '--pinentry-mode', 'loopback', '--passphrase', '', *argv, **kw)
+            passphrase = kw.pop('passphrase', '')
+            return run(signer, '--homedir', home, '--batch', '--pinentry-mode', 'loopback', '--passphrase', passphrase, *argv, **kw)
 
         def fingerprints():
             text = gpg('--with-colons', '--list-secret-keys').stdout.decode()
@@ -80,14 +81,14 @@ def main():
             old = config_snapshot()
             run('git', 'commit', '--allow-empty', '-qm', 'unsigned baseline')
 
-            def start(auto=True, ttl=120, tailscale=False):
+            def start(auto=True, ttl=120, tailscale=False, signing_key=None, extra=()):
                 with socket.socket() as sock:
                     sock.bind(('127.0.0.1', 0))
                     port = sock.getsockname()[1]
                 logfile = root / f'server-{len(servers)}.log'
                 log = logfile.open('wb')
                 cmd = [exe, 'serve', '--bind', f'127.0.0.1:{port}', '--endpoint', f'http://127.0.0.1:{port}',
-                       '--homedir', home, '--gpg', signer, '--key', primary, '--ttl', str(ttl)]
+                       '--homedir', home, '--gpg', signer, '--key', signing_key or primary, '--ttl', str(ttl), *extra]
                 if tailscale:
                     cmd.extend(['--tailscale-serve'])
                     at = cmd.index('--endpoint')
@@ -238,6 +239,52 @@ def main():
                 assert not result.stdout
                 assert '--tailscale-serve 需要' in result.stderr.decode()
             print('PASS: automatic Tailscale Serve, HTTPS discovery, clean ticket output, failure and invalid bind rejection (CLI stub)')
+
+            if not args.portable_fixture:
+                secret = 'test-only passphrase with spaces & quotes\''
+                gpg('--quick-generate-key', 'Protected Test <protected@example.invalid>',
+                    'ed25519', 'sign', '1d', passphrase=secret)
+                protected = fingerprints()[-1]
+                # Disable real Pinentry; clear the agent cache before each run.
+                (home / 'gpg-agent.conf').write_text(
+                    'allow-loopback-pinentry\npinentry-program /nonexistent-test-pinentry\n'
+                )
+                def clear_agent():
+                    run('gpgconf', '--homedir', home, '--kill', 'gpg-agent')
+
+                clear_agent()
+                server, ticket, log = start(signing_key=protected,
+                    extra=['--gpg-passphrase', 'wrong-test-passphrase'])
+                run(exe, 'connect', data=(ticket + '\n').encode())
+                before = run('git', 'rev-parse', 'HEAD').stdout
+                run('git', 'commit', '--allow-empty', '-qm', 'wrong passphrase', success=False)
+                assert run('git', 'rev-parse', 'HEAD').stdout == before
+                run(exe, 'disconnect')
+                server.terminate()
+                server.wait(timeout=5)
+                passfile = root / 'passphrase with spaces.txt'
+                passfile.write_text(secret + '\r\n')
+                passfile.chmod(0o600)
+                for extra in [['--gpg-passphrase', secret], ['--gpg-passphrase-file', passfile]]:
+                    clear_agent()
+                    server, ticket, log = start(signing_key=protected, extra=extra)
+                    run(exe, 'connect', data=(ticket + '\n').encode())
+                    run('git', 'config', 'commit.gpgsign', 'true')
+                    run('git', 'commit', '--allow-empty', '-qm', 'protected signing without Pinentry')
+                    run('git', 'verify-commit', 'HEAD')
+                    actual = run('git', 'log', '-1', '--format=%GF').stdout.decode().strip()
+                    assert actual == protected
+                    assert secret not in cfg_path.read_text()
+                    assert secret not in log.read_text()
+                    run(exe, 'disconnect')
+                    server.terminate()
+                    server.wait(timeout=5)
+                result = run(exe, 'serve', '--gpg-passphrase', 'bad\nsecond-line', success=False)
+                assert not result.stdout and '口令不能包含' in result.stderr.decode()
+                result = run(exe, 'serve', '--gpg-passphrase', secret,
+                             '--gpg-passphrase-file', passfile, success=False)
+                assert not result.stdout
+                print('PASS: protected-key signing with direct/file passphrase, cold agent, no Pinentry, wrong password rejection, no credential/log leak')
 
             # Credential output must not leak into the separately captured server audit.
             all_logs = ''.join(p.read_text(errors='replace') for p in root.glob('server-*.log'))

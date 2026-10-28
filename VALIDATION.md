@@ -1,3 +1,11 @@
+# GPG 无人值守口令更新
+
+记录日期：2026-10-28（Asia/Shanghai）。
+
+- 新增 `--gpg-passphrase` / `--gpg-passphrase-file`，通过 loopback + 标准输入传入 GPG，不使用口令临时文件或 GPG 子进程口令参数。
+- 真实 GnuPG 集成检查通过：为加密私钥清除 agent 缓存并禁用 Pinentry 后，直接参数和 UTF-8/CRLF 文件两种方式均可签署 Git commit 并正确验签；错误口令不创建提交；口令未写入客户端配置和日志。
+- 上一轮推送 `214904d` 的 GitHub Actions 已成功（Windows/Linux）。本次更新的 Windows/Gpg4win 本机执行仍需设备验证。
+
 # 本次更新验证
 
 记录日期：2026-10-28（Asia/Shanghai）。

@@ -252,6 +252,7 @@ pub async fn connect(ticket_file: Option<PathBuf>, gpg: PathBuf) -> Result<()> {
         program: gpg.clone(),
         homedir: Some(home.clone()),
         timeout: Duration::from_secs(30),
+        passphrase: None,
     };
     let out = local
         .run(

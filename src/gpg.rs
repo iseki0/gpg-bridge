@@ -6,12 +6,14 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, process::Stdio, time::Duration};
 use tokio::{io::AsyncWriteExt, process::Command};
+use zeroize::Zeroizing;
 
 #[derive(Clone)]
 pub struct Gpg {
     pub program: PathBuf,
     pub homedir: Option<PathBuf>,
     pub timeout: Duration,
+    pub passphrase: Option<Zeroizing<String>>,
 }
 impl Gpg {
     pub fn command(&self) -> Command {
@@ -94,7 +96,7 @@ impl Gpg {
                 .any(|k| k.fingerprint == key.fingerprint),
             "签名密钥已失效或不可用"
         );
-        let args = vec![
+        let mut args = vec![
             "--batch".into(),
             "--no-tty".into(),
             "--status-fd=2".into(),
@@ -105,6 +107,22 @@ impl Gpg {
             "--output".into(),
             "-".into(),
         ];
+        // GnuPG reads one line from fd 0 for the passphrase, then signs the
+        // remaining stdin bytes. No secret is placed in child argv or on disk.
+        let mut input = Zeroizing::new(Vec::new());
+        let data = if let Some(passphrase) = &self.passphrase {
+            ensure!(
+                !passphrase.contains(['\r', '\n', '\0']),
+                "GPG 口令不能包含换行或 NUL 字符"
+            );
+            args.extend(["--pinentry-mode", "loopback", "--passphrase-fd", "0"].map(str::to_owned));
+            input.extend_from_slice(passphrase.as_bytes());
+            input.push(b'\n');
+            input.extend_from_slice(data);
+            input.as_slice()
+        } else {
+            data
+        };
         let out = self.run(&args, data).await?;
         let stderr = String::from_utf8_lossy(&out.stderr);
         ensure!(

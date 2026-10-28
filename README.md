@@ -4,7 +4,7 @@ Rust 实现的临时远程 OpenPGP 签名服务：Windows 保存私钥并使用�
 
 ## 使用
 
-需要 Windows 上已有 Gpg4win/GnuPG 密钥，云端安装 Git 和 GnuPG。服务端要在你当前登录的 Windows 用户终端运行，才能正常使用桌面 Pinentry。无需导出私钥，不安装 Windows 系统服务。
+需要 Windows 上已有 Gpg4win/GnuPG 密钥，云端安装 Git 和 GnuPG。默认通过桌面 Pinentry 解锁密钥时，服务端要在你当前登录的 Windows 用户终端运行；无人值守可使用下述 loopback 口令参数。无需导出私钥，不安装 Windows 系统服务。
 
 ### 1. Windows：启动本机服务
 
@@ -102,6 +102,22 @@ git verify-tag v1.0
 .\bin\windows-x86_64\gpg-bridge.exe serve --auto-approve --ttl 3600 --log-file .\session-001.log
 ```
 
+如果不在电脑旁边，可同时自动开启转发、允许自动签名，并直接传入 GPG 私钥口令：
+
+```powershell
+.\bin\windows-x86_64\gpg-bridge.exe serve --tailscale-serve --auto-approve --gpg-passphrase '你的私钥口令' --ttl 3600
+```
+
+`--gpg-passphrase` 启用 GnuPG `--pinentry-mode loopback`，替代 Pinentry 弹窗。口令只保存在服务端进程内存，通过标准输入传给 GPG，不写入连接串、客户端配置或动作日志，也不加入 GPG 子进程命令行。直接参数仍可能出现在 gpg-bridge 的进程列表或终端历史中；可改用文件参数：
+
+```powershell
+.\bin\windows-x86_64\gpg-bridge.exe serve --tailscale-serve --auto-approve --gpg-passphrase-file 'C:\private\gpg-passphrase.txt' --ttl 3600
+```
+
+文件需为 UTF-8（无 BOM），内容是一行口令，保留前后空格，只去掉末尾一个 LF/CRLF。两种参数互斥；文件应限制为当前用户可读，由你负责保管和删除。程序启动时读取一次；口令不能包含换行或 NUL。不提供这两个参数时，继续使用原有 GnuPG agent/Pinentry 行为。
+
+Gpg4win 的 agent 必须允许 loopback（通常默认允许）。若提示不允许，在其 `gpg-agent.conf` 中启用 `allow-loopback-pinentry` 并重载 agent。硬件钥匙要求的触摸或设备确认仍需本人完成。`--auto-approve` 控制 gpg-bridge 的逐次确认，口令参数控制私钥解锁；无人值守通常需要两者。多身份首次启动可用 `--key` 指定完整指纹，避免等待身份选择。
+
 `--ttl` 单位为秒，默认 8 小时，最大 24 小时。日志文件必须是新文件，避免意外覆盖或混写。Ctrl+C 或会话到期停止服务并撤销会话；新启动会生成新的身份和口令。
 
 打印内容包括认证成功/失败、读取公钥、签名请求、作者/提交说明或 tag、实际签名钥匙、字节数、SHA-256 摘要、成功/拒绝及耗时。可用 `--verbose` 打印转义后的待签名内容前 300 字符。日志里的 UID、提交说明等不可信文本会转义控制字符并限制长度。日志可能包含姓名、邮箱、提交说明，应按个人数据保管。
@@ -114,7 +130,7 @@ git verify-tag v1.0
 - 每次 RPC 都用新握手：先完成两步握手，再发送加密操作。握手阶段绝不执行签名。一个请求状态只能消费一次；长度经过认证，拒绝篡改、重放和帧截断。不自动重试签名。
 - 默认只接受 Git commit/tag 的基本文本结构；这只是减少误用，**不证明仓库归属或你认可内容**。`--allow-data` 才允许其他数据签名。
 - 限定本会话允许的具体签名指纹，固定本机 GPG 程序和参数；每次签名重新检查有效期/撤销/私钥记录，使用 `fingerprint!` 固定钥匙，并检查 `SIG_CREATED` 实际指纹。
-- 不提供解密、私钥导出、agent 原始协议转发、任意命令执行或远端文件路径访问。口令与私钥解锁都在 Windows/Pinentry 内完成。
+- 不提供解密、私钥导出、agent 原始协议转发、任意命令执行或远端文件路径访问。私钥解锁仅在服务端本机完成，使用 Pinentry 或显式开启的 loopback 口令。
 - 待签名内容限制为 1 MiB，HTTP 请求/响应限制为 2 MiB；握手有速率/状态数量限制，签名串行处理，限制并发请求、读取及 GPG 操作时间。不是面向恶意公网高流量的抗 DDoS 网关，优先使用 tailnet 内访问。
 - 连接串就是临时签名授权：拥有它的人在有效期内都能连接；自动模式下能请求允许范围内的签名。不要提交到仓库或长期保存到共享聊天/日志。协议不防同一云端任务里已能读取凭证的进程。
 - 云端凭证以 0600 文件保存在实际 Git 目录（含 worktree 的独立 Git 目录）中；读取时拒绝符号链接、非当前用户所有及宽松权限的文件。执行时必须信任该仓库的 Git 元数据及本地程序。
@@ -134,7 +150,7 @@ cargo test --locked
 python3 scripts/e2e.py --binary target/release/gpg-bridge
 ```
 
-最后一项在临时目录生成无口令测试密钥并启动临时 agent，运行真实 Git commit/tag 签名、验签、拒绝未授权钥匙、本机确认、过期以及配置恢复测试；不读取现有私钥。
+最后一项在临时目录生成测试密钥并启动临时 agent，运行真实 Git commit/tag 签名、验签、拒绝未授权钥匙、本机确认、过期以及配置恢复测试；不读取现有私钥。另测试带口令密钥：清空 agent 缓存、禁用 Pinentry 后，通过直接参数和口令文件签名并验签；错误口令拒绝签名。
 
 如果运行环境禁止 Unix socket，真实 gpg-agent 无法启动，可选择显式的便携测试模式：
 

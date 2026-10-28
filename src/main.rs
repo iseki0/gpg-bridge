@@ -6,6 +6,7 @@ use gpg_bridge::{
     server,
 };
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(
@@ -50,6 +51,12 @@ enum Commands {
         homedir: Option<PathBuf>,
         #[arg(long, default_value_t = 120)]
         gpg_timeout: u64,
+        /// GPG 口令，使用 loopback 替代 Pinentry；命令行可能被进程列表/历史记录保存
+        #[arg(long, conflicts_with = "gpg_passphrase_file")]
+        gpg_passphrase: Option<String>,
+        /// 从 UTF-8 文件读取 GPG 口令（去掉末尾一个换行），使用 loopback
+        #[arg(long)]
+        gpg_passphrase_file: Option<PathBuf>,
         /// 日志文件（必须为新文件，不包含配对凭证）
         #[arg(long)]
         log_file: Option<PathBuf>,
@@ -109,6 +116,8 @@ async fn run() -> Result<i32> {
             gpg,
             homedir,
             gpg_timeout,
+            gpg_passphrase,
+            gpg_passphrase_file,
             log_file,
             verbose,
         } => {
@@ -120,10 +129,34 @@ async fn run() -> Result<i32> {
                 !tailscale_serve || (bind.ip().is_loopback() && bind.port() != 0),
                 "--tailscale-serve 需要非零端口的回环监听地址"
             );
+            let passphrase = match (gpg_passphrase, gpg_passphrase_file) {
+                (Some(value), _) => Some(Zeroizing::new(value)),
+                (_, Some(path)) => {
+                    let mut value = Zeroizing::new(
+                        std::fs::read_to_string(path)
+                            .context("无法读取 GPG 口令文件（需要 UTF-8）")?,
+                    );
+                    if value.ends_with('\n') {
+                        value.pop();
+                        if value.ends_with('\r') {
+                            value.pop();
+                        }
+                    }
+                    Some(value)
+                }
+                _ => None,
+            };
+            if let Some(value) = &passphrase {
+                ensure!(
+                    !value.contains(['\r', '\n', '\0']),
+                    "GPG 口令不能包含换行或 NUL 字符"
+                );
+            }
             let gpg = Gpg {
                 program: locate_gpg(gpg)?,
                 homedir,
                 timeout: Duration::from_secs(gpg_timeout),
+                passphrase,
             };
             let keys = gpg::select_keys(&gpg, &key, !choose).await?;
             if tailscale_serve {
